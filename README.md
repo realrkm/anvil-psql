@@ -2,7 +2,7 @@
 
 > Full SQL access to your Anvil App Server's PostgreSQL database — with CRUD, table management, pagination, sorting, and atomic transactions.
 
-This module exposes a set of `@anvil.server.callable` functions that let your Anvil client forms query and manage the PostgreSQL database managed by the [Anvil App Server](https://github.com/anvil-works/anvil-runtime) when running locally. It uses a **connection pool**, a **table name cache**, **DB-level read-only enforcement**, and **automatic rollback on failure**.
+This module exposes a set of `@anvil.server.callable` functions that let your Anvil client forms query and manage the PostgreSQL database managed by the [Anvil App Server](https://github.com/anvil-works/anvil-app-server) when running locally. It uses a **connection pool**, a **table name cache**, **DB-level read-only enforcement**, and **automatic rollback on failure**.
 
 ---
 
@@ -19,8 +19,10 @@ This module exposes a set of `@anvil.server.callable` functions that let your An
   - [UPDATE](#update)
   - [DELETE](#delete)
   - [Table Management](#table-management)
+  - [Export and Import](#export-and-import)
 - [Error Handling](#error-handling)
 - [Complete Working Form Example](#complete-working-form-example)
+- [Complete Export / Import Form Example](#complete-export--import-form-example)
 
 ---
 
@@ -40,7 +42,7 @@ This module exposes a set of `@anvil.server.callable` functions that let your An
 pip install psycopg2-binary
 ```
 
-**2. Copy `server_functions.py` into your app's Server Module file located inside server_code folder of your project** (or place it alongside your app entry point).
+**2. Copy `server_functions.py` into your app's Server Module** in the Anvil editor (or place it alongside your app entry point).
 
 **3. Start your app server as normal:**
 
@@ -62,7 +64,7 @@ The module auto-discovers the PostgreSQL port and credentials from `.anvil-data/
 ```bash
 # Example overrides before starting the app server
 export ANVIL_DATA_PATH="/custom/path/to/anvil-data"
-export ANVIL_DB_POOL_SIZE="10"
+export ANVIL_DB_POOL_SIZE="20"
 anvil-app-server --app MyApp
 ```
 
@@ -134,6 +136,33 @@ anvil-app-server --app MyApp
 | `drop_table(table_name)` | Drop a table entirely — **irreversible** | `bool` |
 | `add_column(table_name, column_name, column_type, constraints?)` | Add a column | `bool` |
 | `drop_column(table_name, column_name)` | Remove a column — **irreversible** | `bool` |
+
+### Export and Import
+
+| Function | Description | Returns |
+|---|---|---|
+| `export_schema(tables?)` | Export column definitions + constraints as JSON | `str` (JSON) |
+| `export_data(tables?, batch_size?)` | Export schema + all row data as JSON | `str` (JSON) |
+| `import_schema(export_json, if_exists?)` | Recreate tables from an `export_schema` or `export_data` JSON string | `dict` |
+| `import_data(export_json, if_exists?, truncate_before_insert?)` | Recreate tables and restore all rows from an `export_data` JSON string | `dict` |
+
+**`if_exists` values (used by both import functions):**
+
+| Value | Behaviour |
+|---|---|
+| `'skip'` | Leave existing tables untouched; still insert rows on `import_data` (default) |
+| `'replace'` | DROP and recreate the table, then restore data |
+| `'error'` | Raise an exception if the table already exists |
+
+Both import functions return a summary dict:
+```python
+{
+    "created":       ["table1", ...],
+    "skipped":       ["table2", ...],
+    "replaced":      ["table3", ...],
+    "rows_inserted": {"table1": 42, "table2": 7, ...}  # import_data only
+}
+```
 
 ---
 
@@ -416,6 +445,114 @@ anvil.server.call('drop_column', 'users', 'legacy_token')
 
 ---
 
+### Export and Import
+
+#### Export schema only (no row data)
+
+```python
+# All tables
+schema_json = anvil.server.call('export_schema')
+
+# Specific tables only
+schema_json = anvil.server.call('export_schema', ['users', 'orders'])
+
+# Parse to inspect
+import json
+schema = json.loads(schema_json)
+print(schema['exported_at'])
+for table_name, table_def in schema['tables'].items():
+    print(f"\n{table_name}")
+    for col in table_def['columns']:
+        print(f"  {col['column_name']}  {col['data_type']}")
+```
+
+#### Export schema + all data
+
+```python
+# All tables
+dump_json = anvil.server.call('export_data')
+
+# Specific tables
+dump_json = anvil.server.call('export_data', ['users', 'orders'])
+
+# Inspect row counts
+import json
+dump = json.loads(dump_json)
+for table_name, table_def in dump['tables'].items():
+    print(f"{table_name}: {len(table_def['rows'])} rows")
+```
+
+#### Import schema (recreate tables, no data)
+
+```python
+# Default: skip tables that already exist
+result = anvil.server.call('import_schema', schema_json)
+print(result)
+# {'created': ['users', 'orders'], 'skipped': [], 'replaced': []}
+
+# Drop and recreate tables that already exist
+result = anvil.server.call('import_schema', schema_json, if_exists='replace')
+
+# Raise an error if any table already exists
+result = anvil.server.call('import_schema', schema_json, if_exists='error')
+```
+
+#### Import data (recreate tables + restore rows)
+
+```python
+# Default: skip schema creation for tables that exist, still insert rows
+result = anvil.server.call('import_data', dump_json)
+print(result)
+# {
+#   'created':  ['products'],
+#   'skipped':  ['users'],
+#   'replaced': [],
+#   'rows_inserted': {'products': 150, 'users': 42}
+# }
+
+# Drop and fully restore — useful for disaster recovery
+result = anvil.server.call('import_data', dump_json, if_exists='replace')
+
+# Keep existing schema but clear and reload all rows
+result = anvil.server.call('import_data', dump_json,
+    if_exists='skip',
+    truncate_before_insert=True
+)
+```
+
+#### Full backup-and-restore pattern
+
+```python
+# --- BACKUP ---
+dump_json = anvil.server.call('export_data')
+# Save the string to a file, send it somewhere, store it, etc.
+with open('backup.json', 'w') as f:
+    f.write(dump_json)
+
+# --- RESTORE to a clean database ---
+with open('backup.json') as f:
+    dump_json = f.read()
+
+result = anvil.server.call('import_data', dump_json, if_exists='replace')
+for table, count in result['rows_inserted'].items():
+    print(f"  {table}: {count} rows restored")
+```
+
+#### Migrate data between two apps
+
+```python
+# On the source app — export
+dump_json = anvil.server.call('export_data', ['users', 'products'])
+
+# Transfer dump_json however you like (file, uplink, HTTP, etc.)
+
+# On the target app — import
+result = anvil.server.call('import_data', dump_json, if_exists='replace')
+print(result['rows_inserted'])
+```
+
+---
+
 ## Error Handling
 
 All server functions raise `anvil.server.CallError` on failure. Wrap calls in `try/except` in your Form code:
@@ -446,6 +583,10 @@ except anvil.server.CallError as e:
 | `data must not be empty.` | Called `insert_row` or `update_row` with `{}` |
 | `Row with id=N not found in 'x'.` | `update_row` target ID doesn't exist |
 | `All rows must have identical keys in the same order.` | Inconsistent dicts passed to `insert_many_rows` |
+| `JSON does not look like an anvil-psql export.` | Wrong JSON passed to import functions |
+| `export_type is 'schema', use import_schema() instead.` | Passed schema-only JSON to `import_data` |
+| `Table 'x' already exists.` | `import_schema` / `import_data` called with `if_exists='error'` |
+| `if_exists must be 'skip', 'replace', or 'error'.` | Invalid `if_exists` value |
 
 ### Exposing `_run_query` safely (admin only)
 
@@ -733,6 +874,219 @@ self.repeating_panel_users.set_event_handler('x-edit-user',
 self.repeating_panel_users.set_event_handler('x-delete-user',
     lambda row_id, user_name, **kw: self.delete_user(row_id, user_name)
 )
+```
+
+---
+
+## Complete Export / Import Form Example
+
+A full backup/restore form with progress feedback, table selection, and error handling.
+
+```python
+# Forms/BackupRestore/__init__.py
+import anvil.server
+import anvil.media
+import json
+from anvil import *
+from ._anvil_designer import BackupRestoreTemplate
+
+
+class BackupRestore(BackupRestoreTemplate):
+
+    def __init__(self, **properties):
+        self.init_components(**properties)
+        self._dump_json = None       # holds the last export in memory
+        self.load_table_list()
+
+    # ------------------------------------------------------------------
+    # Startup — populate the table checkboxes
+    # ------------------------------------------------------------------
+
+    def load_table_list(self):
+        try:
+            tables = anvil.server.call('get_tables')
+        except anvil.server.CallError as e:
+            Notification(f"Could not load tables: {e}", style="danger").show()
+            return
+
+        self.check_box_panel.items = [
+            {"table": t, "selected": True} for t in tables
+        ]
+
+    def _selected_tables(self) -> list[str] | None:
+        """Return list of checked table names, or None if all are selected."""
+        items = self.check_box_panel.items or []
+        selected = [i["table"] for i in items if i.get("selected")]
+        if len(selected) == len(items):
+            return None         # None = all tables (slightly faster on server)
+        return selected or None
+
+    # ------------------------------------------------------------------
+    # Export schema only
+    # ------------------------------------------------------------------
+
+    def button_export_schema_click(self, **event_args):
+        self.label_status.text = "Exporting schema…"
+        try:
+            schema_json = anvil.server.call(
+                'export_schema', self._selected_tables()
+            )
+            schema = json.loads(schema_json)
+            table_count = len(schema["tables"])
+            self.label_status.text = (
+                f"Schema exported: {table_count} table(s) "
+                f"at {schema['exported_at']}"
+            )
+            # Offer as a downloadable file
+            anvil.media.download(
+                anvil.BlobMedia(
+                    "application/json",
+                    schema_json.encode(),
+                    name="schema_export.json",
+                )
+            )
+        except anvil.server.CallError as e:
+            self.label_status.text = f"Export failed: {e}"
+            Notification(str(e), style="danger").show()
+
+    # ------------------------------------------------------------------
+    # Export schema + data
+    # ------------------------------------------------------------------
+
+    def button_export_data_click(self, **event_args):
+        self.label_status.text = "Exporting data (this may take a moment)…"
+        try:
+            dump_json = anvil.server.call(
+                'export_data', self._selected_tables()
+            )
+            dump = json.loads(dump_json)
+
+            # Build a summary string
+            summary_lines = []
+            for table_name, table_def in dump["tables"].items():
+                row_count = len(table_def.get("rows", []))
+                summary_lines.append(f"  {table_name}: {row_count} rows")
+
+            self.label_status.text = (
+                f"Data exported at {dump['exported_at']}:\n"
+                + "\n".join(summary_lines)
+            )
+            self._dump_json = dump_json      # keep in memory for quick restore
+
+            anvil.media.download(
+                anvil.BlobMedia(
+                    "application/json",
+                    dump_json.encode(),
+                    name="data_export.json",
+                )
+            )
+        except anvil.server.CallError as e:
+            self.label_status.text = f"Export failed: {e}"
+            Notification(str(e), style="danger").show()
+
+    # ------------------------------------------------------------------
+    # Import — user uploads a JSON file
+    # ------------------------------------------------------------------
+
+    def file_loader_change(self, file, **event_args):
+        """Triggered when the user selects a .json file to import."""
+        if file is None:
+            return
+        try:
+            content = file.get_bytes().decode("utf-8")
+            payload = json.loads(content)
+        except Exception as e:
+            Notification(f"Could not read file: {e}", style="danger").show()
+            return
+
+        export_type = payload.get("export_type", "unknown")
+        table_count = len(payload.get("tables", {}))
+        exported_at = payload.get("exported_at", "unknown")
+
+        self.label_status.text = (
+            f"Loaded {export_type} export ({table_count} tables, "
+            f"exported {exported_at}). Choose an import mode below."
+        )
+        self._dump_json = content
+
+    def _run_import(self, if_exists: str, truncate: bool = False):
+        if not self._dump_json:
+            Notification("No export loaded. Use Export Data first or upload a file.",
+                         style="warning").show()
+            return
+
+        payload = json.loads(self._dump_json)
+        export_type = payload.get("export_type")
+
+        self.label_status.text = "Importing…"
+        try:
+            if export_type == "schema":
+                result = anvil.server.call(
+                    'import_schema', self._dump_json, if_exists
+                )
+                rows_info = ""
+            else:
+                result = anvil.server.call(
+                    'import_data', self._dump_json, if_exists, truncate
+                )
+                rows_info = "\n" + "\n".join(
+                    f"  {t}: {n} rows"
+                    for t, n in result.get("rows_inserted", {}).items()
+                )
+
+            self.label_status.text = (
+                f"Import complete.\n"
+                f"  Created:  {result['created']}\n"
+                f"  Skipped:  {result['skipped']}\n"
+                f"  Replaced: {result['replaced']}"
+                + rows_info
+            )
+            Notification("Import successful.", style="success").show()
+            self.load_table_list()          # refresh table list
+
+        except anvil.server.CallError as e:
+            self.label_status.text = f"Import failed: {e}"
+            Notification(str(e), style="danger").show()
+
+    def button_import_skip_click(self, **event_args):
+        """Import — skip tables that already exist."""
+        self._run_import(if_exists="skip")
+
+    def button_import_replace_click(self, **event_args):
+        """Import — drop and recreate tables that already exist."""
+        if not confirm(
+            "This will DROP and recreate existing tables. All current data will be lost. Continue?"
+        ):
+            return
+        self._run_import(if_exists="replace")
+
+    def button_import_reload_click(self, **event_args):
+        """Import — keep schema, truncate rows, then reload from export."""
+        if not confirm(
+            "This will TRUNCATE all matching tables before inserting. Continue?"
+        ):
+            return
+        self._run_import(if_exists="skip", truncate=True)
+```
+
+**Suggested form layout:**
+
+```
+[ Export Schema ]  [ Export Data ]
+─────────────────────────────────────
+Tables to include:
+  ☑ users   ☑ orders   ☑ products  …
+
+─────────────────────────────────────
+Import from file:  [ Upload JSON ]
+
+[ Import (skip existing) ]
+[ Import (replace existing) ]
+[ Import (truncate & reload) ]
+
+─────────────────────────────────────
+Status:
+  …
 ```
 
 ---
