@@ -40,7 +40,7 @@ This module exposes a set of `@anvil.server.callable` functions that let your An
 pip install psycopg2-binary
 ```
 
-**2. Copy `server_functions.py` into your app's Server Module (inside server_code folder) of your project** or place it alongside your app entry point).
+**2. Copy `server_functions.py` into your app's Server Module file located inside server_code folder of your project** (or place it alongside your app entry point).
 
 **3. Start your app server as normal:**
 
