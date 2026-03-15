@@ -62,7 +62,7 @@ The module auto-discovers the PostgreSQL port and credentials from `.anvil-data/
 ```bash
 # Example overrides before starting the app server
 export ANVIL_DATA_PATH="/custom/path/to/anvil-data"
-export ANVIL_DB_POOL_SIZE="20"
+export ANVIL_DB_POOL_SIZE="10"
 anvil-app-server --app MyApp
 ```
 
