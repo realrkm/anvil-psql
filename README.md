@@ -2,7 +2,7 @@
 
 > Full SQL access to your Anvil App Server's PostgreSQL database — with CRUD, table management, pagination, sorting, and atomic transactions.
 
-This module exposes a set of `@anvil.server.callable` functions that let your Anvil client forms query and manage the PostgreSQL database managed by the [Anvil App Server](https://github.com/anvil-works/anvil-app-server) when running locally. It uses a **connection pool**, a **table name cache**, **DB-level read-only enforcement**, and **automatic rollback on failure**.
+This module exposes a set of `@anvil.server.callable` functions that let your Anvil client forms query and manage the PostgreSQL database managed by the [Anvil App Server](https://github.com/anvil-works/anvil-runtime) when running locally. It uses a **connection pool**, a **table name cache**, **DB-level read-only enforcement**, and **automatic rollback on failure**.
 
 ---
 
