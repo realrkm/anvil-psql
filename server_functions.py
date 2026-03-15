@@ -1,5 +1,8 @@
 import os
+import json
 import shlex
+import decimal
+import datetime
 import threading
 import psycopg2
 import psycopg2.pool
@@ -647,3 +650,561 @@ def drop_column(table_name: str, column_name: str) -> bool:
             )
             conn.commit()
             return True
+
+
+# ============================================================
+# EXPORT / IMPORT
+# ============================================================
+
+# --- JSON serialiser that handles every PostgreSQL type psycopg2 returns ---
+
+class _PgEncoder(json.JSONEncoder):
+    """Encode PostgreSQL-native Python types to JSON-safe values."""
+    def default(self, obj):
+        if isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
+            return obj.isoformat()
+        if isinstance(obj, datetime.timedelta):
+            return str(obj)
+        if isinstance(obj, decimal.Decimal):
+            return float(obj)
+        if isinstance(obj, memoryview):
+            return obj.tobytes().decode("utf-8", errors="replace")
+        if isinstance(obj, bytes):
+            return obj.decode("utf-8", errors="replace")
+        return super().default(obj)
+
+
+# --- Type coercion map used during import ---
+# Maps PostgreSQL data_type strings → callable that converts a JSON value back.
+
+_PG_COERCE = {
+    "integer":                      int,
+    "bigint":                       int,
+    "smallint":                     int,
+    "numeric":                      decimal.Decimal,
+    "real":                         float,
+    "double precision":             float,
+    "boolean":                      lambda v: v if isinstance(v, bool)
+                                              else str(v).lower() in ("true", "1", "yes"),
+    "date":                         lambda v: datetime.date.fromisoformat(v)
+                                              if isinstance(v, str) else v,
+    "timestamp without time zone":  lambda v: datetime.datetime.fromisoformat(v)
+                                              if isinstance(v, str) else v,
+    "timestamp with time zone":     lambda v: datetime.datetime.fromisoformat(v)
+                                              if isinstance(v, str) else v,
+    "time without time zone":       lambda v: datetime.time.fromisoformat(v)
+                                              if isinstance(v, str) else v,
+}
+
+
+def _coerce_value(value, pg_type: str):
+    """Convert a JSON-decoded value to the correct Python type for *pg_type*."""
+    if value is None:
+        return None
+    fn = _PG_COERCE.get(pg_type)
+    return fn(value) if fn else value
+
+
+def _get_table_schema(cur, table_name: str) -> list[dict]:
+    """
+    Return full column metadata for *table_name* ordered by ordinal position.
+    Each dict has keys: column_name, data_type, is_nullable, column_default,
+    character_maximum_length, numeric_precision, numeric_scale.
+    """
+    cur.execute("""
+        SELECT
+            column_name,
+            data_type,
+            is_nullable,
+            column_default,
+            character_maximum_length,
+            numeric_precision,
+            numeric_scale,
+            ordinal_position
+        FROM information_schema.columns
+        WHERE table_schema = 'app_tables' AND table_name = %s
+        ORDER BY ordinal_position
+    """, (table_name,))
+    keys = [
+        "column_name", "data_type", "is_nullable", "column_default",
+        "character_maximum_length", "numeric_precision", "numeric_scale",
+        "ordinal_position",
+    ]
+    return [dict(zip(keys, row)) for row in cur.fetchall()]
+
+
+def _get_table_constraints(cur, table_name: str) -> list[dict]:
+    """
+    Return primary key and unique constraint metadata for *table_name*.
+    Each dict has keys: constraint_name, constraint_type, columns (list).
+    """
+    cur.execute("""
+        SELECT
+            tc.constraint_name,
+            tc.constraint_type,
+            array_agg(kcu.column_name ORDER BY kcu.ordinal_position) AS columns
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+         AND tc.table_schema    = kcu.table_schema
+        WHERE tc.table_schema = 'app_tables'
+          AND tc.table_name   = %s
+          AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')
+        GROUP BY tc.constraint_name, tc.constraint_type
+    """, (table_name,))
+    return [
+        {"constraint_name": r[0], "constraint_type": r[1], "columns": list(r[2])}
+        for r in cur.fetchall()
+    ]
+
+
+@anvil.server.callable
+def export_schema(tables: list[str] | None = None) -> str:
+    """
+    Export the schema (column definitions + constraints) for one or more tables
+    as a JSON string.
+
+    Parameters:
+        tables: list of table names to export, or ``None`` to export every table
+                in the app_tables schema.
+
+    Returns:
+        A JSON string with the structure:
+        {
+            "anvil_psql_export": true,
+            "export_type": "schema",
+            "exported_at": "<ISO timestamp>",
+            "tables": {
+                "<table_name>": {
+                    "columns":     [ { column_name, data_type, is_nullable,
+                                       column_default, ... }, ... ],
+                    "constraints": [ { constraint_name, constraint_type,
+                                       columns: [...] }, ... ]
+                },
+                ...
+            }
+        }
+
+    Client example:
+        schema_json = anvil.server.call('export_schema')
+        schema_json = anvil.server.call('export_schema', ['users', 'orders'])
+    """
+    with _PooledConn() as conn:
+        with conn.cursor() as cur:
+            all_tables = _refresh_table_cache(cur)
+            target_tables = sorted(tables if tables is not None else all_tables)
+
+            for t in target_tables:
+                _safe_table_name(t)
+                if t not in all_tables:
+                    raise ValueError(f"Table '{t}' not found.")
+
+            result = {
+                "anvil_psql_export": True,
+                "export_type": "schema",
+                "exported_at": datetime.datetime.utcnow().isoformat(),
+                "tables": {},
+            }
+
+            for t in target_tables:
+                result["tables"][t] = {
+                    "columns":     _get_table_schema(cur, t),
+                    "constraints": _get_table_constraints(cur, t),
+                }
+
+            return json.dumps(result, cls=_PgEncoder, indent=2)
+
+
+@anvil.server.callable
+def export_data(tables: list[str] | None = None, batch_size: int = 500) -> str:
+    """
+    Export the schema AND all row data for one or more tables as a JSON string.
+
+    Parameters:
+        tables:     list of table names to export, or ``None`` for all tables.
+        batch_size: internal fetch batch size (does not affect output).
+
+    Returns:
+        A JSON string with the structure:
+        {
+            "anvil_psql_export": true,
+            "export_type": "data",
+            "exported_at": "<ISO timestamp>",
+            "tables": {
+                "<table_name>": {
+                    "columns":     [ { column_name, data_type, ... }, ... ],
+                    "constraints": [ ... ],
+                    "rows":        [ { col: value, ... }, ... ]
+                },
+                ...
+            }
+        }
+
+    Client example:
+        dump = anvil.server.call('export_data')
+        dump = anvil.server.call('export_data', ['users', 'orders'])
+    """
+    with _PooledConn() as conn:
+        with conn.cursor() as cur:
+            all_tables = _refresh_table_cache(cur)
+            target_tables = sorted(tables if tables is not None else all_tables)
+
+            for t in target_tables:
+                _safe_table_name(t)
+                if t not in all_tables:
+                    raise ValueError(f"Table '{t}' not found.")
+
+            result = {
+                "anvil_psql_export": True,
+                "export_type": "data",
+                "exported_at": datetime.datetime.utcnow().isoformat(),
+                "tables": {},
+            }
+
+            for t in target_tables:
+                columns = _get_table_schema(cur, t)
+                col_names = [c["column_name"] for c in columns]
+
+                # Stream rows in batches to keep memory usage bounded
+                cur.execute(
+                    sql.SQL("SELECT * FROM {} ORDER BY id").format(
+                        sql.Identifier(t)
+                    )
+                )
+                rows = []
+                while True:
+                    batch = cur.fetchmany(batch_size)
+                    if not batch:
+                        break
+                    for raw_row in batch:
+                        rows.append(dict(zip(col_names, raw_row)))
+
+                result["tables"][t] = {
+                    "columns":     columns,
+                    "constraints": _get_table_constraints(cur, t),
+                    "rows":        rows,
+                }
+
+            return json.dumps(result, cls=_PgEncoder, indent=2)
+
+
+@anvil.server.callable
+def import_schema(
+    export_json: str,
+    if_exists: str = "skip",
+) -> dict:
+    """
+    Recreate tables from a JSON string produced by ``export_schema`` or
+    ``export_data``.
+
+    Parameters:
+        export_json: the JSON string returned by export_schema / export_data.
+        if_exists:   what to do when a table already exists:
+                       'skip'    — leave existing table untouched (default)
+                       'replace' — DROP and recreate the table (all data lost)
+                       'error'   — raise an exception
+
+    Returns:
+        {
+            "created":  ["table1", ...],   # tables that were newly created
+            "skipped":  ["table2", ...],   # tables that already existed (if_exists='skip')
+            "replaced": ["table3", ...],   # tables that were dropped and recreated
+        }
+
+    Client example:
+        result = anvil.server.call('import_schema', schema_json)
+        result = anvil.server.call('import_schema', schema_json, if_exists='replace')
+    """
+    if if_exists not in ("skip", "replace", "error"):
+        raise ValueError("if_exists must be 'skip', 'replace', or 'error'.")
+
+    try:
+        payload = json.loads(export_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON: {e}")
+
+    if not payload.get("anvil_psql_export"):
+        raise ValueError("JSON does not look like an anvil-psql export.")
+
+    summary = {"created": [], "skipped": [], "replaced": []}
+
+    with _PooledConn() as conn:
+        with conn.cursor() as cur:
+            existing = _refresh_table_cache(cur)
+
+            for table_name, table_def in payload["tables"].items():
+                _safe_table_name(table_name)
+
+                if table_name in existing:
+                    if if_exists == "error":
+                        raise ValueError(
+                            f"Table '{table_name}' already exists "
+                            "(use if_exists='skip' or 'replace')."
+                        )
+                    if if_exists == "skip":
+                        summary["skipped"].append(table_name)
+                        continue
+                    # replace — drop first
+                    cur.execute(
+                        sql.SQL("DROP TABLE IF EXISTS {}").format(
+                            sql.Identifier(table_name)
+                        )
+                    )
+
+                # Build CREATE TABLE from exported column metadata.
+                # Skip the serial/sequence default on `id` — we re-declare it
+                # as SERIAL so sequences are created fresh.
+                col_defs = []
+                for col in table_def["columns"]:
+                    cname = col["column_name"]
+                    ctype = col["data_type"]
+                    nullable = col["is_nullable"] == "YES"
+                    default  = col.get("column_default") or ""
+
+                    # Remap the `id` column back to SERIAL PRIMARY KEY
+                    if cname == "id" and "nextval" in (default or ""):
+                        col_defs.append(sql.SQL("id SERIAL PRIMARY KEY"))
+                        continue
+
+                    # Build NOT NULL / DEFAULT fragments
+                    fragments = [
+                        sql.Identifier(cname),
+                        sql.SQL(ctype),
+                    ]
+                    if not nullable:
+                        fragments.append(sql.SQL("NOT NULL"))
+                    # Only carry over safe, non-sequence defaults
+                    if default and "nextval" not in default:
+                        fragments.append(sql.SQL(f"DEFAULT {default}"))
+
+                    col_defs.append(sql.SQL(" ").join(fragments))
+
+                cur.execute(
+                    sql.SQL("CREATE TABLE {t} ({c})").format(
+                        t=sql.Identifier(table_name),
+                        c=sql.SQL(", ").join(col_defs),
+                    )
+                )
+
+                # Recreate UNIQUE constraints (PKs are already handled above)
+                for constraint in table_def.get("constraints", []):
+                    if constraint["constraint_type"] == "UNIQUE":
+                        ucols = sql.SQL(", ").join(
+                            map(sql.Identifier, constraint["columns"])
+                        )
+                        cur.execute(
+                            sql.SQL(
+                                "ALTER TABLE {t} ADD CONSTRAINT {cn} UNIQUE ({c})"
+                            ).format(
+                                t=sql.Identifier(table_name),
+                                cn=sql.Identifier(constraint["constraint_name"]),
+                                c=ucols,
+                            )
+                        )
+
+                if if_exists == "replace" and table_name in existing:
+                    summary["replaced"].append(table_name)
+                else:
+                    summary["created"].append(table_name)
+
+            conn.commit()
+            _invalidate_table_cache()
+
+    return summary
+
+
+@anvil.server.callable
+def import_data(
+    export_json: str,
+    if_exists: str = "skip",
+    truncate_before_insert: bool = False,
+) -> dict:
+    """
+    Recreate tables AND restore all row data from a JSON string produced by
+    ``export_data``.
+
+    Parameters:
+        export_json:            JSON string from export_data.
+        if_exists:              what to do when a table already exists:
+                                  'skip'    — skip schema creation, still insert rows
+                                  'replace' — DROP + recreate table, then insert rows
+                                  'error'   — raise an exception if table exists
+        truncate_before_insert: if True, TRUNCATE existing tables before inserting
+                                rows (only meaningful when if_exists='skip').
+
+    Returns:
+        {
+            "created":  ["table1", ...],
+            "skipped":  ["table2", ...],
+            "replaced": ["table3", ...],
+            "rows_inserted": { "table1": 42, "table2": 7, ... }
+        }
+
+    Client example:
+        result = anvil.server.call('import_data', dump_json)
+        result = anvil.server.call('import_data', dump_json,
+                                   if_exists='replace')
+        result = anvil.server.call('import_data', dump_json,
+                                   truncate_before_insert=True)
+    """
+    if if_exists not in ("skip", "replace", "error"):
+        raise ValueError("if_exists must be 'skip', 'replace', or 'error'.")
+
+    try:
+        payload = json.loads(export_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON: {e}")
+
+    if not payload.get("anvil_psql_export"):
+        raise ValueError("JSON does not look like an anvil-psql export.")
+
+    if payload.get("export_type") != "data":
+        raise ValueError(
+            "JSON was produced by export_schema (no row data). "
+            "Use import_schema() instead, or re-export with export_data()."
+        )
+
+    summary: dict = {
+        "created": [], "skipped": [], "replaced": [],
+        "rows_inserted": {},
+    }
+
+    with _PooledConn() as conn:
+        try:
+            with conn.cursor() as cur:
+                existing = _refresh_table_cache(cur)
+
+                for table_name, table_def in payload["tables"].items():
+                    _safe_table_name(table_name)
+                    columns   = table_def["columns"]
+                    rows      = table_def.get("rows", [])
+
+                    # Build a type map: column_name → pg data_type
+                    type_map  = {c["column_name"]: c["data_type"] for c in columns}
+
+                    # ---- schema phase ----
+                    if table_name in existing:
+                        if if_exists == "error":
+                            raise ValueError(
+                                f"Table '{table_name}' already exists."
+                            )
+                        if if_exists == "replace":
+                            cur.execute(
+                                sql.SQL("DROP TABLE IF EXISTS {}").format(
+                                    sql.Identifier(table_name)
+                                )
+                            )
+                            # Recreate schema (same logic as import_schema)
+                            _create_table_from_def(cur, table_name, table_def)
+                            summary["replaced"].append(table_name)
+                        else:  # skip
+                            summary["skipped"].append(table_name)
+                            if truncate_before_insert:
+                                cur.execute(
+                                    sql.SQL("TRUNCATE TABLE {} RESTART IDENTITY").format(
+                                        sql.Identifier(table_name)
+                                    )
+                                )
+                    else:
+                        _create_table_from_def(cur, table_name, table_def)
+                        summary["created"].append(table_name)
+
+                    # ---- data phase ----
+                    if not rows:
+                        summary["rows_inserted"][table_name] = 0
+                        continue
+
+                    # Exclude `id` from insert so the sequence generates new IDs,
+                    # unless the table was replaced (we want to restore original IDs).
+                    restoring_ids = (
+                        if_exists == "replace" or table_name in summary["created"]
+                    ) and "id" in rows[0]
+
+                    if restoring_ids:
+                        insert_cols = list(rows[0].keys())
+                    else:
+                        insert_cols = [k for k in rows[0].keys() if k != "id"]
+
+                    col_sql = sql.SQL(", ").join(map(sql.Identifier, insert_cols))
+                    insert_q = sql.SQL(
+                        "INSERT INTO {t} ({c}) VALUES %s"
+                    ).format(t=sql.Identifier(table_name), c=col_sql)
+
+                    # Coerce JSON values back to correct Python types
+                    values = [
+                        [_coerce_value(row.get(c), type_map.get(c, "text"))
+                         for c in insert_cols]
+                        for row in rows
+                    ]
+
+                    execute_values(cur, insert_q.as_string(conn), values)
+                    summary["rows_inserted"][table_name] = cur.rowcount
+
+                    # If we restored explicit IDs, advance the sequence past the
+                    # max id so future inserts don't collide.
+                    if restoring_ids and "id" in insert_cols:
+                        cur.execute(
+                            sql.SQL(
+                                "SELECT setval(pg_get_serial_sequence({t}, 'id'), "
+                                "COALESCE(MAX(id), 1)) FROM {tbl}"
+                            ).format(
+                                t=sql.Literal(f"app_tables.{table_name}"),
+                                tbl=sql.Identifier(table_name),
+                            )
+                        )
+
+                conn.commit()
+                _invalidate_table_cache()
+
+        except Exception:
+            conn.rollback()
+            raise
+
+    return summary
+
+
+def _create_table_from_def(cur, table_name: str, table_def: dict):
+    """
+    Internal helper: CREATE TABLE from an exported table definition dict.
+    Shared by import_schema and import_data.
+    """
+    columns = table_def["columns"]
+    col_defs = []
+
+    for col in columns:
+        cname    = col["column_name"]
+        ctype    = col["data_type"]
+        nullable = col["is_nullable"] == "YES"
+        default  = col.get("column_default") or ""
+
+        if cname == "id" and "nextval" in default:
+            col_defs.append(sql.SQL("id SERIAL PRIMARY KEY"))
+            continue
+
+        fragments = [sql.Identifier(cname), sql.SQL(ctype)]
+        if not nullable:
+            fragments.append(sql.SQL("NOT NULL"))
+        if default and "nextval" not in default:
+            fragments.append(sql.SQL(f"DEFAULT {default}"))
+
+        col_defs.append(sql.SQL(" ").join(fragments))
+
+    cur.execute(
+        sql.SQL("CREATE TABLE {t} ({c})").format(
+            t=sql.Identifier(table_name),
+            c=sql.SQL(", ").join(col_defs),
+        )
+    )
+
+    for constraint in table_def.get("constraints", []):
+        if constraint["constraint_type"] == "UNIQUE":
+            ucols = sql.SQL(", ").join(map(sql.Identifier, constraint["columns"]))
+            cur.execute(
+                sql.SQL(
+                    "ALTER TABLE {t} ADD CONSTRAINT {cn} UNIQUE ({c})"
+                ).format(
+                    t=sql.Identifier(table_name),
+                    cn=sql.Identifier(constraint["constraint_name"]),
+                    c=ucols,
+                )
+            )
